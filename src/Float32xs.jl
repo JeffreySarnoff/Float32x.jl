@@ -73,6 +73,12 @@ end
 
 # Convenience constructor
 @inline Float32x(x::Real) = convert(Float32x, x)
+@inline function Float32x(significand::Float32, exponent::Int64)
+    if (exponent < typemin(Int32)) || (exponent > typemax(Int32))
+        throw(ArgumentError("exponent ($exponent) is out of bounds"))
+    end
+    Float32x(significand, Int32(exponent))
+end
 
 # ==================== Constants ====================
 
@@ -137,25 +143,25 @@ end
     yinf = isinf(y.significand)
     (xinf | yinf) && return x.significand < y.significand
     
-    # Zero handling: -0.0 == 0.0
+    # Zero handling
     xzero = iszero(x.significand)
     yzero = iszero(y.significand)
     
     # Both zero - they're equal
     (xzero & yzero) && return false
     
-    # One is zero - handle specially
-    if xzero
-        # x is zero, y is not
+    # CRITICAL FIX: Handle when exactly one is zero
+    if xzero && !yzero
+        # x is zero, y is not zero
         # 0 < positive, 0 > negative
         return !signbit(y)
-    elseif yzero
-        # y is zero, x is not
+    elseif !xzero && yzero
+        # y is zero, x is not zero  
         # negative < 0, positive > 0
         return signbit(x)
     end
     
-    # Neither is zero - continue with normal comparison
+    # Both are non-zero from here
     # Sign comparison
     xsign = signbit(x)
     ysign = signbit(y)

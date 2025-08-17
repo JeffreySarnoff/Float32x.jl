@@ -1,10 +1,10 @@
 """
-    Float32xs
+    Float32xModule
 
 A module implementing an extended precision floating-point type using a Float32 significand
 and Int32 exponent, providing operations similar to Float64.
 """
-module Float32xs
+module Float32xModule
 
 export Float32x, zero, one, inf, nan, eps
 export iszero, isone, isinf, isnan, isfinite, issubnormal, signbit
@@ -40,7 +40,7 @@ import Base: hash
     Float32x <: AbstractFloat
 
 Extended precision floating-point type using Float32 significand and Int32 exponent.
-Represents: significand × 2^exponent
+Represents: significand × 2^exponent where 1.0 <= |significand| < 2.0 for normalized values
 """
 struct Float32x <: AbstractFloat
     significand::Float32
@@ -51,15 +51,14 @@ struct Float32x <: AbstractFloat
         # Handle special cases
         isnan(s) && return new(NaN32, Int32(0))
         isinf(s) && return new(s, Int32(0))
-        iszero(s) && return new(0.0f0, Int32(0))
+        iszero(s) && return new(copysign(0.0f0, s), Int32(0))  # Preserve signed zero
         
         # Normalize: ensure 1.0 <= |significand| < 2.0 for non-zero values
-        # Using optimized bit manipulation for frexp
         sig_bits = reinterpret(UInt32, s)
         exp_bits = (sig_bits >> 23) & 0x000000ff
         
         if exp_bits == 0  # Subnormal number
-            # Handle subnormal case
+            # Need full frexp for subnormals
             sig, exp_adj = frexp(s)
             return new(Float32(sig * 2), e + Int32(exp_adj) - 1)
         else
@@ -84,6 +83,12 @@ const NEGINF_FLOAT32X = Float32x(-Inf32, Int32(0))
 const NAN_FLOAT32X = Float32x(NaN32, Int32(0))
 const EPS_FLOAT32X = Float32x(eps(Float32), Int32(0))
 
+# Exponent limits for Float32 and Float64
+const FLOAT32_MAX_EXP = 127
+const FLOAT32_MIN_EXP = -126
+const FLOAT64_MAX_EXP = 1023
+const FLOAT64_MIN_EXP = -1022
+
 @inline Base.zero(::Type{Float32x}) = ZERO_FLOAT32X
 @inline Base.one(::Type{Float32x}) = ONE_FLOAT32X
 @inline inf(::Type{Float32x}) = INF_FLOAT32X
@@ -99,13 +104,17 @@ const EPS_FLOAT32X = Float32x(eps(Float32), Int32(0))
 @inline Base.isinf(x::Float32x) = isinf(x.significand)
 @inline Base.isnan(x::Float32x) = isnan(x.significand)
 @inline Base.isfinite(x::Float32x) = isfinite(x.significand)
-@inline Base.issubnormal(x::Float32x) = issubnormal(x.significand)
+@inline Base.issubnormal(x::Float32x) = false  # Float32x values are always normalized
 @inline Base.signbit(x::Float32x) = signbit(x.significand)
 
 # ==================== Comparison Operations ====================
 
 @inline Base.:(==)(x::Float32x, y::Float32x) = begin
-    # Fast path for common cases
+    # NaN != NaN
+    (isnan(x.significand) | isnan(y.significand)) && return false
+    # -0.0 == 0.0
+    (iszero(x.significand) & iszero(y.significand)) && return true
+    # Compare both fields
     x.significand == y.significand && x.exponent == y.exponent
 end
 
@@ -113,24 +122,29 @@ end
 
 @inline Base.isless(x::Float32x, y::Float32x) = begin
     # NaN handling
-    (isnan(x) | isnan(y)) && return false
+    (isnan(x.significand) | isnan(y.significand)) && return false
     
     # Infinity handling
     xinf = isinf(x.significand)
     yinf = isinf(y.significand)
     (xinf | yinf) && return x.significand < y.significand
     
+    # Zero handling: -0.0 == 0.0
+    xzero = iszero(x.significand)
+    yzero = iszero(y.significand)
+    (xzero & yzero) && return false
+    
     # Sign comparison
     xsign = signbit(x)
     ysign = signbit(y)
     xsign != ysign && return xsign
     
-    # Exponent comparison
+    # Same sign: compare exponents
     if x.exponent != y.exponent
         return xsign ? x.exponent > y.exponent : x.exponent < y.exponent
     end
     
-    # Significand comparison
+    # Same sign and exponent: compare significands
     return x.significand < y.significand
 end
 
@@ -155,20 +169,50 @@ end
 @inline Base.convert(::Type{Float32x}, x::Float64) = begin
     isnan(x) && return NAN_FLOAT32X
     isinf(x) && return x > 0 ? INF_FLOAT32X : NEGINF_FLOAT32X
-    iszero(x) && return ZERO_FLOAT32X
+    iszero(x) && return copysign(ZERO_FLOAT32X, x)
     
     # Use optimized frexp for Float64
     sig, exp = frexp(x)
     Float32x(Float32(sig * 2), Int32(exp - 1))
 end
 
-@inline Base.convert(::Type{Float64}, x::Float32x) = 
-    ldexp(Float64(x.significand), Int(x.exponent))
+@inline Base.convert(::Type{Float64}, x::Float32x) = begin
+    # Handle special cases
+    isnan(x.significand) && return NaN64
+    isinf(x.significand) && return Float64(x.significand)
+    iszero(x.significand) && return copysign(0.0, x.significand)
+    
+    # Check for overflow/underflow
+    total_exp = Int(x.exponent)
+    
+    # Float64 can handle much larger range than Float32x
+    if total_exp > FLOAT64_MAX_EXP
+        return copysign(Inf64, x.significand)
+    elseif total_exp < FLOAT64_MIN_EXP - 52  # Account for significand bits
+        return copysign(0.0, x.significand)
+    end
+    
+    # Safe conversion
+    ldexp(Float64(x.significand), total_exp)
+end
 
 @inline Base.convert(::Type{Float32}, x::Float32x) = begin
-    # Clamp exponent to Float32 range
-    exp_clamped = clamp(x.exponent, Int32(-126), Int32(127))
-    ldexp(x.significand, Int(exp_clamped))
+    # Handle special cases
+    isnan(x.significand) && return NaN32
+    isinf(x.significand) && return x.significand
+    iszero(x.significand) && return copysign(0.0f0, x.significand)
+    
+    # Check for overflow/underflow
+    total_exp = Int(x.exponent)
+    
+    if total_exp > FLOAT32_MAX_EXP
+        return copysign(Inf32, x.significand)
+    elseif total_exp < FLOAT32_MIN_EXP - 23  # Account for significand bits
+        return copysign(0.0f0, x.significand)
+    end
+    
+    # Safe conversion
+    ldexp(x.significand, total_exp)
 end
 
 @inline Base.Float64(x::Float32x) = convert(Float64, x)
@@ -182,7 +226,7 @@ Base.promote_rule(::Type{Float32x}, ::Type{Float64}) = Float32x
 # ==================== Basic Arithmetic ====================
 
 @inline Base.:(+)(x::Float32x, y::Float32x) = begin
-    # Special value handling with short-circuit evaluation
+    # Special value handling
     isnan(x.significand) && return x
     isnan(y.significand) && return y
     
@@ -194,9 +238,11 @@ Base.promote_rule(::Type{Float32x}, ::Type{Float64}) = Float32x
         return xinf ? x : y
     end
     
-    # Zero handling
-    iszero(x.significand) && return y
-    iszero(y.significand) && return x
+    # Zero handling - preserve sign for -0.0 + 0.0 = 0.0
+    xzero = iszero(x.significand)
+    yzero = iszero(y.significand)
+    xzero && return y
+    yzero && return x
     
     # Align exponents efficiently
     exp_diff = x.exponent - y.exponent
@@ -230,7 +276,7 @@ end
     isnan(x.significand) && return x
     isnan(y.significand) && return y
     
-    # Check for infinity or zero
+    # Check for infinity and zero
     xinf = isinf(x.significand)
     yinf = isinf(y.significand)
     xzero = iszero(x.significand)
@@ -242,11 +288,19 @@ end
     # Handle infinities
     (xinf | yinf) && return Float32x(x.significand * y.significand, Int32(0))
     
-    # Handle zeros
-    (xzero | yzero) && return ZERO_FLOAT32X
+    # Handle zeros - preserve sign
+    (xzero | yzero) && return Float32x(x.significand * y.significand, Int32(0))
+    
+    # Check for potential overflow in exponent addition
+    exp_sum = Int64(x.exponent) + Int64(y.exponent)
+    if exp_sum > typemax(Int32)
+        return Float32x(copysign(Inf32, x.significand * y.significand), Int32(0))
+    elseif exp_sum < typemin(Int32)
+        return Float32x(copysign(0.0f0, x.significand * y.significand), Int32(0))
+    end
     
     # Normal multiplication
-    Float32x(x.significand * y.significand, x.exponent + y.exponent)
+    Float32x(x.significand * y.significand, Int32(exp_sum))
 end
 
 @inline Base.:(/)(x::Float32x, y::Float32x) = begin
@@ -256,15 +310,17 @@ end
     
     yzero = iszero(y.significand)
     if yzero
-        iszero(x.significand) && return NAN_FLOAT32X
+        iszero(x.significand) && return NAN_FLOAT32X  # 0/0 = NaN
         s = copysign(1.0f0, x.significand) * copysign(1.0f0, y.significand)
         return Float32x(s * Inf32, Int32(0))
     end
     
     yinf = isinf(y.significand)
     if yinf
-        isinf(x.significand) && return NAN_FLOAT32X
-        return ZERO_FLOAT32X
+        isinf(x.significand) && return NAN_FLOAT32X  # Inf/Inf = NaN
+        # finite/Inf = 0 with appropriate sign
+        s = copysign(1.0f0, x.significand) * copysign(1.0f0, y.significand)
+        return Float32x(copysign(0.0f0, s), Int32(0))
     end
     
     if isinf(x.significand)
@@ -272,10 +328,22 @@ end
         return Float32x(s * Inf32, Int32(0))
     end
     
-    iszero(x.significand) && return ZERO_FLOAT32X
+    if iszero(x.significand)
+        # 0/finite = 0 with appropriate sign
+        s = copysign(1.0f0, x.significand) * copysign(1.0f0, y.significand)
+        return Float32x(copysign(0.0f0, s), Int32(0))
+    end
+    
+    # Check for potential overflow/underflow in exponent subtraction
+    exp_diff = Int64(x.exponent) - Int64(y.exponent)
+    if exp_diff > typemax(Int32)
+        return Float32x(copysign(Inf32, x.significand / y.significand), Int32(0))
+    elseif exp_diff < typemin(Int32)
+        return Float32x(copysign(0.0f0, x.significand / y.significand), Int32(0))
+    end
     
     # Normal division
-    Float32x(x.significand / y.significand, x.exponent - y.exponent)
+    Float32x(x.significand / y.significand, Int32(exp_diff))
 end
 
 @inline Base.:(^)(x::Float32x, n::Integer) = begin
@@ -287,24 +355,70 @@ end
         return ONE_FLOAT32X / (x^(-n))
     end
     
-    # Square-and-multiply algorithm
+    # Square-and-multiply algorithm with overflow checking
     result = ONE_FLOAT32X
     base = x
     m = n
     while m > 0
-        isodd(m) && (result *= base)
+        if isodd(m)
+            result = result * base
+            # Check for overflow/special values
+            (isinf(result.significand) | isnan(result.significand)) && return result
+        end
         m >>= 1
-        m > 0 && (base *= base)
+        if m > 0
+            base = base * base
+            # Check for overflow/special values
+            (isinf(base.significand) | isnan(base.significand)) && (m > 0 && isodd(m)) && return base
+        end
     end
     result
 end
 
-Base.:(^)(x::Float32x, y::Float32x) = exp(y * log(x))
+Base.:(^)(x::Float32x, y::Float32x) = begin
+    # Handle special cases properly
+    isnan(x.significand) && return x
+    isnan(y.significand) && return y
+    
+    # 1^y = 1 for any y (including Inf and NaN is already handled)
+    isone(x) && return ONE_FLOAT32X
+    
+    # x^0 = 1 for any x != 0
+    iszero(y) && return ONE_FLOAT32X
+    
+    # 0^y handling
+    if iszero(x)
+        if signbit(y)
+            # 0^(-y) = Inf for y > 0
+            return INF_FLOAT32X
+        else
+            # 0^y = 0 for y > 0
+            return ZERO_FLOAT32X
+        end
+    end
+    
+    # x^1 = x
+    isone(y) && return x
+    
+    # Negative base with non-integer exponent = NaN
+    if signbit(x)
+        y_float = Float64(y)
+        if y_float != trunc(y_float)
+            return NAN_FLOAT32X
+        end
+    end
+    
+    exp(y * log(abs(x))) * (signbit(x) && isodd(Int(trunc(Float64(y)))) ? -1 : 1)
+end
 
 # ==================== Pre-arithmetic Operations ====================
 
 @inline Base.abs(x::Float32x) = Float32x(abs(x.significand), x.exponent)
-@inline Base.sign(x::Float32x) = Float32x(sign(x.significand), Int32(0))
+@inline Base.sign(x::Float32x) = begin
+    isnan(x.significand) && return x
+    iszero(x.significand) && return x  # Preserve signed zero
+    Float32x(copysign(1.0f0, x.significand), Int32(0))
+end
 
 @inline Base.copysign(x::Float32x, y::Float32x) = 
     Float32x(copysign(x.significand, y.significand), x.exponent)
@@ -315,21 +429,59 @@ Base.:(^)(x::Float32x, y::Float32x) = exp(y * log(x))
 @inline Base.nextfloat(x::Float32x) = begin
     isnan(x.significand) && return x
     (isinf(x.significand) & (x.significand > 0)) && return x
-    Float32x(nextfloat(x.significand), x.exponent)
+    
+    next_sig = nextfloat(x.significand)
+    # Check if we wrapped around (went from just under 2.0 to 2.0)
+    if next_sig >= 2.0f0
+        Float32x(1.0f0, x.exponent + Int32(1))
+    else
+        Float32x(next_sig, x.exponent)
+    end
 end
 
 @inline Base.prevfloat(x::Float32x) = begin
     isnan(x.significand) && return x
     (isinf(x.significand) & (x.significand < 0)) && return x
-    Float32x(prevfloat(x.significand), x.exponent)
+    
+    prev_sig = prevfloat(x.significand)
+    # Check if we wrapped around (went from 1.0 to just under 1.0)
+    if x.significand == 1.0f0 && prev_sig < 1.0f0
+        Float32x(prevfloat(2.0f0), x.exponent - Int32(1))
+    else
+        Float32x(prev_sig, x.exponent)
+    end
 end
 
 # ==================== Rounding Operations ====================
 
-Base.round(x::Float32x) = convert(Float32x, round(Float64(x)))
-Base.floor(x::Float32x) = convert(Float32x, floor(Float64(x)))
-Base.ceil(x::Float32x) = convert(Float32x, ceil(Float64(x)))
-Base.trunc(x::Float32x) = convert(Float32x, trunc(Float64(x)))
+Base.round(x::Float32x) = begin
+    isnan(x.significand) | isinf(x.significand) && return x
+    f64 = Float64(x)
+    # Check if the value is too large to round
+    abs(f64) >= 2^53 && return x
+    convert(Float32x, round(f64))
+end
+
+Base.floor(x::Float32x) = begin
+    isnan(x.significand) | isinf(x.significand) && return x
+    f64 = Float64(x)
+    abs(f64) >= 2^53 && return x
+    convert(Float32x, floor(f64))
+end
+
+Base.ceil(x::Float32x) = begin
+    isnan(x.significand) | isinf(x.significand) && return x
+    f64 = Float64(x)
+    abs(f64) >= 2^53 && return x
+    convert(Float32x, ceil(f64))
+end
+
+Base.trunc(x::Float32x) = begin
+    isnan(x.significand) | isinf(x.significand) && return x
+    f64 = Float64(x)
+    abs(f64) >= 2^53 && return x
+    convert(Float32x, trunc(f64))
+end
 
 @inline Base.significand(x::Float32x) = Float64(x.significand)
 @inline Base.exponent(x::Float32x) = x.exponent
@@ -337,10 +489,39 @@ Base.trunc(x::Float32x) = convert(Float32x, trunc(Float64(x)))
 # ==================== Mathematical Functions ====================
 
 # ---- Exponential functions ----
-Base.exp(x::Float32x) = convert(Float32x, exp(Float64(x)))
-Base.exp2(x::Float32x) = convert(Float32x, exp2(Float64(x)))
-Base.exp10(x::Float32x) = convert(Float32x, exp10(Float64(x)))
-Base.expm1(x::Float32x) = convert(Float32x, expm1(Float64(x)))
+Base.exp(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return x.significand > 0 ? x : ZERO_FLOAT32X
+    # Overflow/underflow handling
+    f64 = Float64(x)
+    f64 > 88.72 && return INF_FLOAT32X  # exp overflow threshold
+    f64 < -87.33 && return ZERO_FLOAT32X  # exp underflow threshold
+    convert(Float32x, exp(f64))
+end
+
+Base.exp2(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return x.significand > 0 ? x : ZERO_FLOAT32X
+    f64 = Float64(x)
+    f64 > 127 && return INF_FLOAT32X
+    f64 < -126 && return ZERO_FLOAT32X
+    convert(Float32x, exp2(f64))
+end
+
+Base.exp10(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return x.significand > 0 ? x : ZERO_FLOAT32X
+    f64 = Float64(x)
+    f64 > 38.5 && return INF_FLOAT32X
+    f64 < -37.9 && return ZERO_FLOAT32X
+    convert(Float32x, exp10(f64))
+end
+
+Base.expm1(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return x.significand > 0 ? x : NEGINF_FLOAT32X
+    convert(Float32x, expm1(Float64(x)))
+end
 
 # ---- Logarithmic functions with optimizations ----
 const LOG2_CONST = Float32(0.6931471805599453)
@@ -352,7 +533,6 @@ const LOG2_CONST = Float32(0.6931471805599453)
     signbit(x) && return NAN_FLOAT32X
     
     # log(s * 2^e) = log(s) + e * log(2)
-    # Compute in Float32 for consistency
     log_sig = log(x.significand)
     exp_contrib = x.exponent * LOG2_CONST
     Float32x(log_sig + exp_contrib, Int32(0))
@@ -368,14 +548,31 @@ end
     Float32x(log2(x.significand) + Float32(x.exponent), Int32(0))
 end
 
-@inline Base.log10(x::Float32x) = log(x) * Float32x(0.4342944819032518f0, Int32(0))
-@inline Base.log1p(x::Float32x) = log(ONE_FLOAT32X + x)
+@inline Base.log10(x::Float32x) = begin
+    isnan(x.significand) && return x
+    (isinf(x.significand) & (x.significand > 0)) && return x
+    iszero(x.significand) && return NEGINF_FLOAT32X
+    signbit(x) && return NAN_FLOAT32X
+    
+    log(x) * Float32x(0.4342944819032518f0, Int32(0))
+end
+
+@inline Base.log1p(x::Float32x) = begin
+    isnan(x.significand) && return x
+    # log1p(-1) = -Inf
+    x == Float32x(-1.0f0, Int32(0)) && return NEGINF_FLOAT32X
+    # log1p(x) for x < -1 = NaN
+    x < Float32x(-1.0f0, Int32(0)) && return NAN_FLOAT32X
+    isinf(x.significand) && x.significand > 0 && return x
+    
+    log(ONE_FLOAT32X + x)
+end
 
 # ---- Root functions with optimizations ----
 @inline Base.sqrt(x::Float32x) = begin
     isnan(x.significand) && return x
     (isinf(x.significand) & (x.significand > 0)) && return x
-    iszero(x.significand) && return x
+    iszero(x.significand) && return x  # Preserve signed zero
     signbit(x) && return NAN_FLOAT32X
     
     # sqrt(s * 2^e) = sqrt(s) * 2^(e/2)
@@ -388,33 +585,114 @@ end
     end
 end
 
-Base.cbrt(x::Float32x) = convert(Float32x, cbrt(Float64(x)))
+Base.cbrt(x::Float32x) = begin
+    isnan(x.significand) | isinf(x.significand) | iszero(x.significand) && return x
+    convert(Float32x, cbrt(Float64(x)))
+end
 
 # ---- Trigonometric functions ----
-Base.sin(x::Float32x) = convert(Float32x, sin(Float64(x)))
-Base.cos(x::Float32x) = convert(Float32x, cos(Float64(x)))
-Base.tan(x::Float32x) = convert(Float32x, tan(Float64(x)))
-Base.asin(x::Float32x) = convert(Float32x, asin(Float64(x)))
-Base.acos(x::Float32x) = convert(Float32x, acos(Float64(x)))
-Base.atan(x::Float32x) = convert(Float32x, atan(Float64(x)))
+Base.sin(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return NAN_FLOAT32X  # sin(±Inf) = NaN
+    convert(Float32x, sin(Float64(x)))
+end
+
+Base.cos(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return NAN_FLOAT32X  # cos(±Inf) = NaN
+    convert(Float32x, cos(Float64(x)))
+end
+
+Base.tan(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return NAN_FLOAT32X  # tan(±Inf) = NaN
+    convert(Float32x, tan(Float64(x)))
+end
+
+Base.asin(x::Float32x) = begin
+    isnan(x.significand) && return x
+    abs(x) > ONE_FLOAT32X && return NAN_FLOAT32X  # asin(|x|>1) = NaN
+    convert(Float32x, asin(Float64(x)))
+end
+
+Base.acos(x::Float32x) = begin
+    isnan(x.significand) && return x
+    abs(x) > ONE_FLOAT32X && return NAN_FLOAT32X  # acos(|x|>1) = NaN
+    convert(Float32x, acos(Float64(x)))
+end
+
+Base.atan(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return Float32x(copysign(Float32(π/2), x.significand), Int32(0))
+    convert(Float32x, atan(Float64(x)))
+end
 
 # ---- Hyperbolic functions ----
-Base.sinh(x::Float32x) = convert(Float32x, sinh(Float64(x)))
-Base.cosh(x::Float32x) = convert(Float32x, cosh(Float64(x)))
-Base.tanh(x::Float32x) = convert(Float32x, tanh(Float64(x)))
-Base.asinh(x::Float32x) = convert(Float32x, asinh(Float64(x)))
-Base.acosh(x::Float32x) = convert(Float32x, acosh(Float64(x)))
-Base.atanh(x::Float32x) = convert(Float32x, atanh(Float64(x)))
+Base.sinh(x::Float32x) = begin
+    isnan(x.significand) | isinf(x.significand) && return x
+    f64 = Float64(x)
+    abs(f64) > 88.72 && return copysign(INF_FLOAT32X, x)  # sinh overflow
+    convert(Float32x, sinh(f64))
+end
+
+Base.cosh(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return INF_FLOAT32X  # cosh(±Inf) = Inf
+    f64 = Float64(x)
+    abs(f64) > 88.72 && return INF_FLOAT32X  # cosh overflow
+    convert(Float32x, cosh(f64))
+end
+
+Base.tanh(x::Float32x) = begin
+    isnan(x.significand) && return x
+    isinf(x.significand) && return Float32x(copysign(1.0f0, x.significand), Int32(0))
+    convert(Float32x, tanh(Float64(x)))
+end
+
+Base.asinh(x::Float32x) = begin
+    isnan(x.significand) | isinf(x.significand) && return x
+    convert(Float32x, asinh(Float64(x)))
+end
+
+Base.acosh(x::Float32x) = begin
+    isnan(x.significand) && return x
+    x < ONE_FLOAT32X && return NAN_FLOAT32X  # acosh(x<1) = NaN
+    isinf(x.significand) && x.significand > 0 && return x
+    convert(Float32x, acosh(Float64(x)))
+end
+
+Base.atanh(x::Float32x) = begin
+    isnan(x.significand) && return x
+    abs_x = abs(x)
+    abs_x > ONE_FLOAT32X && return NAN_FLOAT32X  # atanh(|x|>1) = NaN
+    abs_x == ONE_FLOAT32X && return copysign(INF_FLOAT32X, x)  # atanh(±1) = ±Inf
+    convert(Float32x, atanh(Float64(x)))
+end
 
 # ---- Utility functions ----
-@inline Base.ldexp(x::Float32x, n::Integer) = 
-    Float32x(x.significand, x.exponent + Int32(n))
+@inline Base.ldexp(x::Float32x, n::Integer) = begin
+    isnan(x.significand) | isinf(x.significand) | iszero(x.significand) && return x
+    
+    # Check for exponent overflow/underflow
+    new_exp = Int64(x.exponent) + Int64(n)
+    if new_exp > typemax(Int32)
+        return copysign(INF_FLOAT32X, x)
+    elseif new_exp < typemin(Int32) + 200  # Leave some room for normalization
+        return copysign(ZERO_FLOAT32X, x)
+    end
+    
+    Float32x(x.significand, Int32(new_exp))
+end
 
 @inline Base.frexp(x::Float32x) = 
     (Float64(x.significand) * 0.5, Int(x.exponent) + 1)
 
 Base.modf(x::Float32x) = begin
+    isnan(x.significand) | isinf(x.significand) && return (copysign(ZERO_FLOAT32X, x), x)
     f64 = Float64(x)
+    # Check if integer part would overflow Float64
+    abs(f64) >= 2^53 && return (copysign(ZERO_FLOAT32X, x), x)
+    
     ipart, fpart = modf(f64)
     (convert(Float32x, fpart), convert(Float32x, ipart))
 end
@@ -430,7 +708,19 @@ Base.show(io::IO, x::Float32x) = begin
         print(io, signbit(x) ? "-0.0" : "0.0")
     else
         # Show as decimal for better readability
-        print(io, Float64(x))
+        # But handle potential overflow in conversion
+        if abs(x.exponent) < 300
+            f64 = Float64(x)
+            if isfinite(f64)
+                print(io, f64)
+            else
+                # Fallback to showing components
+                print(io, x.significand, " × 2^", x.exponent)
+            end
+        else
+            # Very large exponent - show in component form
+            print(io, x.significand, " × 2^", x.exponent)
+        end
     end
 end
 

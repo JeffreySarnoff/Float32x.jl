@@ -33,6 +33,14 @@ using .Float32xs
         @test eps(Float32x) == Float32x(eps(Float32))
         @test isinf(typemax(Float32x)) && !signbit(typemax(Float32x))
         @test isinf(typemin(Float32x)) && signbit(typemin(Float32x))
+        
+        # New: floatmin and floatmax
+        @test floatmin(Float32x).significand == 1.0f0
+        @test floatmin(Float32x).exponent == typemin(Int32)
+        @test floatmax(Float32x).significand == prevfloat(2.0f0)
+        @test floatmax(Float32x).exponent == typemax(Int32)
+        @test floatmin(Float32x) > zero(Float32x)
+        @test floatmax(Float32x) < inf(Float32x)
     end
     
     # ==================== Predicates ====================
@@ -154,6 +162,52 @@ using .Float32xs
         @test !signbit(Float64(Float32x(0.0f0, Int32(0))))
         @test signbit(Float32(Float32x(-0.0f0, Int32(0))))
         @test !signbit(Float32(Float32x(0.0f0, Int32(0))))
+        
+        # New: BigFloat conversions
+        @testset "BigFloat Conversions" begin
+            # To BigFloat
+            a = Float32x(1.5f0, Int32(10))
+            big_a = BigFloat(a)
+            @test big_a == BigFloat(1.5) * BigFloat(2)^10
+            
+            # From BigFloat
+            big_b = BigFloat(π)
+            b = Float32x(big_b)
+            @test abs(Float64(b) - Float64(big_b)) < 1e-6  # Lost precision is expected
+            
+            # Special values
+            @test isnan(BigFloat(nan(Float32x)))
+            @test isinf(BigFloat(inf(Float32x))) && BigFloat(inf(Float32x)) > 0
+            @test isinf(BigFloat(Float32x(-Inf32, Int32(0)))) && BigFloat(Float32x(-Inf32, Int32(0))) < 0
+            @test iszero(BigFloat(zero(Float32x)))
+            @test signbit(BigFloat(Float32x(-0.0f0, Int32(0))))
+            
+            # Large exponents
+            huge = Float32x(1.5f0, Int32(1000))
+            big_huge = BigFloat(huge)
+            @test big_huge == BigFloat(1.5) * BigFloat(2)^1000
+            
+            # From BigFloat with overflow
+            big_overflow = BigFloat(2)^(BigFloat(typemax(Int32)) * 2)
+            @test isinf(Float32x(big_overflow))
+            
+            # From BigFloat with underflow
+            big_underflow = BigFloat(2)^(BigFloat(typemin(Int32)) * 2)
+            @test iszero(Float32x(big_underflow))
+            
+            # Round-trip for normal values
+            for val in [1.5, -2.25, 100.0, -0.125]
+                x = Float32x(val)
+                @test Float64(Float32x(BigFloat(x))) ≈ Float64(x)
+            end
+            
+            # Promotion rule
+            @test promote_type(Float32x, BigFloat) == BigFloat
+            x = Float32x(2.0f0, Int32(0))
+            y = BigFloat(3)
+            @test x + y isa BigFloat
+            @test x * y isa BigFloat
+        end
     end
     
     # ==================== Arithmetic Operations ====================
@@ -470,10 +524,41 @@ using .Float32xs
         @test isinf(ldexp(a, typemax(Int32)))
         @test iszero(ldexp(a, typemin(Int32)))
         
-        # frexp
+        # New: ldexp with separate significand and exponent
+        @test ldexp(1.5, 10, Float32x) == Float32x(1.5f0, Int32(10))
+        @test ldexp(3.0, 5, Float32x) == Float32x(1.5f0, Int32(6))  # 3.0 = 1.5 * 2^1
+        @test isnan(ldexp(NaN, 0, Float32x))
+        @test isinf(ldexp(Inf, 0, Float32x))
+        @test iszero(ldexp(0.0, 100, Float32x))
+        
+        # frexp - enhanced testing
         frac, exp = frexp(a)
         @test frac ≈ 0.75  # 1.5/2
         @test exp == 11  # exponent + 1
+        
+        # Verify frexp reconstruction: x = frac * 2^exp
+        @test Float64(a) ≈ frac * 2^exp
+        
+        # frexp special cases
+        frac_nan, exp_nan = frexp(nan(Float32x))
+        @test isnan(frac_nan) && exp_nan == 0
+        
+        frac_inf, exp_inf = frexp(inf(Float32x))
+        @test isinf(frac_inf) && exp_inf == 0
+        
+        frac_zero, exp_zero = frexp(zero(Float32x))
+        @test iszero(frac_zero) && exp_zero == 0
+        
+        frac_negzero, exp_negzero = frexp(Float32x(-0.0f0, Int32(0)))
+        @test iszero(frac_negzero) && signbit(frac_negzero) && exp_negzero == 0
+        
+        # Test frexp/ldexp round-trip
+        for val in [Float32x(1.5f0, Int32(10)), Float32x(-2.5f0, Int32(-5)), 
+                    Float32x(1.0f0, Int32(100)), Float32x(1.99f0, Int32(-100))]
+            f, e = frexp(val)
+            reconstructed = ldexp(f, e, Float32x)
+            @test Float64(reconstructed) ≈ Float64(val)
+        end
         
         # modf
         b = Float32x(3.7f0, Int32(0))
@@ -487,6 +572,46 @@ using .Float32xs
         
         fpart_nan, ipart_nan = modf(nan(Float32x))
         @test iszero(fpart_nan) && isnan(ipart_nan)
+        
+        # New: Test significand and exponent functions
+        @testset "significand and exponent" begin
+            x = Float32x(1.5f0, Int32(10))
+            
+            # significand function
+            @test significand(x) == 1.5
+            @test isnan(significand(nan(Float32x)))
+            @test isinf(significand(inf(Float32x))) && significand(inf(Float32x)) > 0
+            @test isinf(significand(Float32x(-Inf32, Int32(0)))) && significand(Float32x(-Inf32, Int32(0))) < 0
+            @test iszero(significand(zero(Float32x)))
+            @test signbit(significand(Float32x(-0.0f0, Int32(0))))
+            
+            # exponent function
+            @test exponent(x) == Int32(10)
+            @test_throws DomainError exponent(nan(Float32x))
+            @test_throws DomainError exponent(inf(Float32x))
+            @test_throws DomainError exponent(zero(Float32x))
+            
+            # Test with various values
+            y = Float32x(1.0f0, Int32(0))
+            @test significand(y) == 1.0
+            @test exponent(y) == Int32(0)
+            
+            z = Float32x(1.99f0, Int32(-50))
+            @test significand(z) ≈ 1.99
+            @test exponent(z) == Int32(-50)
+        end
+        
+        # New: Test floatmin and floatmax instance methods
+        @testset "floatmin and floatmax instance methods" begin
+            x = Float32x(1.5f0, Int32(10))
+            
+            @test floatmin(x) == floatmin(Float32x)
+            @test floatmax(x) == floatmax(Float32x)
+            
+            # These should work for any value
+            @test floatmin(nan(Float32x)) == floatmin(Float32x)
+            @test floatmax(inf(Float32x)) == floatmax(Float32x)
+        end
     end
     
     # ==================== Display and Hashing ====================

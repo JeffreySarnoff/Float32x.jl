@@ -23,8 +23,12 @@ organize the module by subsections for ease of development.
 ----
 review the code looking for opportunities to improve the performance while keeping correctness and clarity
 ----
-there is at least one error -- conversion from Float32x to Float32 or to Float64 can underflow and can overflow.  This must be handled properly everywhere it may occur.  Also look for other incompletely realized logic and fix.
+there is at least one error -- conversion from Float32x to Float32 or to Float64 can underflow and can overflow.  
+This must be handled properly everywhere it may occur.  
+Also look for other incompletely realized logic and fix.
 ----
-
+add to the source module correct, robust, and efficient versions of Base:floatmin, floatmax, frexp, ldexp, significand, exponent for Float32x.
+Provide interconversion with BigFloat.
+----
 
 ---

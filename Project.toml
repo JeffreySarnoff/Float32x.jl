@@ -1,0 +1,7 @@
+name = "Float32x"
+uuid = "34eb7916-0650-4b00-98fc-a9f64a29567d"
+author = "Jeffrey Sarnoff <jeffrey.sarnoff@gmail.com>"
+version = "0.1.0"
+
+[compat]
+julia = "1.11"

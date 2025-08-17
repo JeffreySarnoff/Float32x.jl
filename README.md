@@ -30,5 +30,5 @@ Also look for other incompletely realized logic and fix.
 add to the source module correct, robust, and efficient versions of Base:floatmin, floatmax, frexp, ldexp, significand, exponent for Float32x.
 Provide interconversion with BigFloat.
 ----
-
+this test fails: floatmin(Float32x) > zero(Float32x)
 ---

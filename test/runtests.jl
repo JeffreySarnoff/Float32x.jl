@@ -1,5 +1,5 @@
 using Test
-using .Float32xModule
+using .Float32xs
 
 @testset "Float32x Comprehensive Tests" begin
     

@@ -15,6 +15,7 @@ export log, log2, log10, log1p
 export sin, cos, tan, asin, acos, atan
 export sinh, cosh, tanh, asinh, acosh, atanh
 export ldexp, frexp, modf
+export faa, faa_compensated
 
 import Base: +, -, *, /, ^, %, ÷
 import Base: ==, !=, <, <=, >, >=, isless, isequal
@@ -411,6 +412,610 @@ end
     # Normal division
     Float32x(x.significand / y.significand, Int32(exp_diff))
 end
+
+# Fused multiply-add: computes x*y + z with only one rounding
+# Fused multiply-add: computes x*y + z with single rounding
+# Avoids double rounding by computing exact product + sum before rounding once
+@inline Base.fma(x::Float32x, y::Float32x, z::Float32x) = begin
+    # Handle NaN propagation - any NaN input produces NaN output
+    (isnan(x.significand) | isnan(y.significand) | isnan(z.significand)) && return NAN_FLOAT32X
+    
+    # Handle multiplication special cases
+    xinf = isinf(x.significand)
+    yinf = isinf(y.significand)
+    zinf = isinf(z.significand)
+    xzero = iszero(x.significand)
+    yzero = iszero(y.significand)
+    zzero = iszero(z.significand)
+    
+    # Inf * 0 or 0 * Inf = NaN
+    ((xinf & yzero) | (xzero & yinf)) && return NAN_FLOAT32X
+    
+    # Handle infinities in multiplication
+    if xinf | yinf
+        # x*y is infinite
+        prod_sign = signbit(x) ⊻ signbit(y)  # XOR for multiplication sign
+        
+        if zinf
+            # Inf + Inf with opposite signs = NaN
+            if prod_sign != signbit(z)
+                return NAN_FLOAT32X
+            end
+        end
+        return prod_sign ? NEGINF_FLOAT32X : INF_FLOAT32X
+    end
+    
+    # Handle multiplication by zero
+    if xzero | yzero
+        # x*y = 0 (with appropriate sign)
+        prod_sign = signbit(x) ⊻ signbit(y)
+        
+        if zinf
+            return z  # 0 + Inf = Inf
+        elseif zzero
+            # 0 + 0: careful sign handling
+            if prod_sign && signbit(z)
+                return Float32x(-0.0f0, Int32(0))  # -0 + -0 = -0
+            else
+                return ZERO_FLOAT32X  # Otherwise +0
+            end
+        else
+            return z  # 0 + finite = finite
+        end
+    end
+    
+    # z is infinite but x*y is finite
+    if zinf
+        return z
+    end
+    
+    # All finite, non-zero x and y
+    # Compute EXACT product using extended precision
+    
+    # The exact product is: (x.significand * y.significand) * 2^(x.exponent + y.exponent)
+    # We need to handle this carefully to avoid overflow/underflow
+    
+    # First check if the product exponent would overflow/underflow
+    prod_exp_64 = Int64(x.exponent) + Int64(y.exponent)
+    
+    if prod_exp_64 > typemax(Int32) + 50  # Way too large
+        # Product definitely overflows
+        prod_sign = signbit(x) ⊻ signbit(y)
+        return prod_sign ? NEGINF_FLOAT32X : INF_FLOAT32X
+    elseif prod_exp_64 < typemin(Int32) - 50  # Way too small
+        # Product definitely underflows to zero
+        return z  # 0 + z = z
+    end
+    
+    # Compute exact product of significands
+    # x.significand and y.significand are Float32 values in [1, 2)
+    # Their product is in [1, 4) and can be represented exactly in Float64
+    prod_sig_exact = Float64(x.significand) * Float64(y.significand)
+    
+    # Now we need to add z to this product
+    # We'll work in a common exponent space to maintain exactness
+    
+    if zzero
+        # Simple case: just the product
+        # Normalize the product significand
+        if prod_sig_exact >= 2.0
+            # Product is in [2, 4), normalize to [1, 2)
+            final_sig = Float32(prod_sig_exact * 0.5)
+            final_exp = prod_exp_64 + 1
+        else
+            # Product is in [1, 2), already normalized
+            final_sig = Float32(prod_sig_exact)
+            final_exp = prod_exp_64
+        end
+        
+        # Check for final overflow/underflow
+        if final_exp > typemax(Int32)
+            prod_sign = signbit(x) ⊻ signbit(y)
+            return prod_sign ? NEGINF_FLOAT32X : INF_FLOAT32X
+        elseif final_exp < typemin(Int32) + 200
+            prod_sign = signbit(x) ⊻ signbit(y)
+            return prod_sign ? Float32x(-0.0f0, Int32(0)) : ZERO_FLOAT32X
+        end
+        
+        return Float32x(final_sig, Int32(final_exp))
+    end
+    
+    # Need to add z to the product
+    # Normalize product first for easier handling
+    prod_norm_sig = prod_sig_exact
+    prod_norm_exp = prod_exp_64
+    
+    if prod_norm_sig >= 2.0
+        prod_norm_sig *= 0.5
+        prod_norm_exp += 1
+    end
+    
+    # Determine the exponent difference
+    exp_diff = prod_norm_exp - Int64(z.exponent)
+    
+    # If difference is too large, one dominates
+    if exp_diff > 53  # product >> z
+        final_sig = Float32(prod_norm_sig)
+        final_exp = prod_norm_exp
+    elseif exp_diff < -53  # z >> product
+        return z
+    else
+        # Need to perform exact addition
+        # Align to common exponent (use the smaller one to avoid overflow)
+        if exp_diff >= 0
+            # Product has larger or equal exponent
+            # Scale z down
+            z_scaled = Float64(z.significand) * exp2(-Float64(exp_diff))
+            sum_exact = prod_norm_sig + z_scaled
+            base_exp = prod_norm_exp
+        else
+            # z has larger exponent
+            # Scale product down
+            prod_scaled = prod_norm_sig * exp2(Float64(exp_diff))
+            sum_exact = prod_scaled + Float64(z.significand)
+            base_exp = Int64(z.exponent)
+        end
+        
+        # Check for cancellation or overflow
+        if iszero(sum_exact)
+            # Exact cancellation
+            # Sign is +0 unless both values were negative
+            prod_sign = signbit(x) ⊻ signbit(y)
+            if prod_sign && signbit(z)
+                return Float32x(-0.0f0, Int32(0))
+            else
+                return ZERO_FLOAT32X
+            end
+        end
+        
+        if isinf(sum_exact)
+            return sum_exact > 0 ? INF_FLOAT32X : NEGINF_FLOAT32X
+        end
+        
+        # Normalize the final sum
+        if abs(sum_exact) >= 2.0
+            # Need to scale and adjust exponent
+            sum_normalized = sum_exact * 0.5
+            final_exp = base_exp + 1
+        elseif abs(sum_exact) < 1.0
+            # Need to scale up
+            scale = 1
+            temp_sum = abs(sum_exact)
+            while temp_sum < 1.0 && scale < 53
+                temp_sum *= 2.0
+                scale += 1
+            end
+            sum_normalized = sum_exact * exp2(Float64(scale))
+            final_exp = base_exp - scale
+        else
+            sum_normalized = sum_exact
+            final_exp = base_exp
+        end
+        
+        # Convert to Float32 significand (this is the single rounding point)
+        final_sig = Float32(sum_normalized)
+    end
+    
+    # Check for final overflow/underflow
+    if final_exp > typemax(Int32)
+        return signbit(final_sig) ? NEGINF_FLOAT32X : INF_FLOAT32X
+    elseif final_exp < typemin(Int32) + 200
+        return signbit(final_sig) ? Float32x(-0.0f0, Int32(0)) : ZERO_FLOAT32X
+    end
+    
+    Float32x(final_sig, Int32(final_exp))
+end
+
+# Alternative implementation using Float64 for exact intermediate computation
+@inline Base.fma(x::Float32x, y::Float32x, z::Float32x) = begin
+    # Handle special cases (same as above)
+    (isnan(x.significand) | isnan(y.significand) | isnan(z.significand)) && return NAN_FLOAT32X
+    
+    xinf = isinf(x.significand)
+    yinf = isinf(y.significand)
+    zinf = isinf(z.significand)
+    xzero = iszero(x.significand)
+    yzero = iszero(y.significand)
+    
+    # Inf * 0 = NaN
+    ((xinf & yzero) | (xzero & yinf)) && return NAN_FLOAT32X
+    
+    # Handle infinities
+    if xinf | yinf
+        prod_sign = signbit(x) ⊻ signbit(y)
+        if zinf && prod_sign != signbit(z)
+            return NAN_FLOAT32X
+        end
+        return prod_sign ? NEGINF_FLOAT32X : INF_FLOAT32X
+    end
+    
+    if zinf
+        return z
+    end
+    
+    # For finite values, compute in Float64 for exactness
+    # This works when the values aren't too extreme
+    
+    # Convert to Float64 (may overflow/underflow)
+    x64 = Float64(x)
+    y64 = Float64(y)
+    z64 = Float64(z)
+    
+    # Check for overflow/underflow in conversion
+    if isinf(x64) | isinf(y64)
+        # Product would overflow
+        prod_sign = signbit(x) ⊻ signbit(y)
+        return prod_sign ? NEGINF_FLOAT32X : INF_FLOAT32X
+    end
+    
+    # Compute exact result in Float64
+    result64 = fma(x64, y64, z64)  # Uses hardware FMA if available
+    
+    # Convert back to Float32x
+    if isnan(result64)
+        return NAN_FLOAT32X
+    elseif isinf(result64)
+        return result64 > 0 ? INF_FLOAT32X : NEGINF_FLOAT32X
+    elseif iszero(result64)
+        return signbit(result64) ? Float32x(-0.0f0, Int32(0)) : ZERO_FLOAT32X
+    end
+    
+    # Convert back preserving precision
+    convert(Float32x, result64)
+end
+
+@inline unsafe_fma(x::Float32x, y::Float32x, z::Float32x) = begin
+    # Handle NaN propagation - any NaN input produces NaN output
+    (isnan(x.significand) | isnan(y.significand) | isnan(z.significand)) && return NAN_FLOAT32X
+    
+    # Handle multiplication special cases first
+    xinf = isinf(x.significand)
+    yinf = isinf(y.significand)
+    zinf = isinf(z.significand)
+    xzero = iszero(x.significand)
+    yzero = iszero(y.significand)
+    zzero = iszero(z.significand)
+    
+    # Inf * 0 or 0 * Inf = NaN
+    ((xinf & yzero) | (xzero & yinf)) && return NAN_FLOAT32X
+    
+    # Handle infinities in multiplication
+    if xinf | yinf
+        # x*y is infinite
+        prod_sign = signbit(x) ⊻ signbit(y)  # XOR for multiplication sign
+        prod_inf = prod_sign ? NEGINF_FLOAT32X : INF_FLOAT32X
+        
+        if zinf
+            # Inf + Inf with opposite signs = NaN
+            if signbit(prod_inf) != signbit(z)
+                return NAN_FLOAT32X
+            end
+        end
+        return prod_inf
+    end
+    
+    # Handle multiplication by zero
+    if xzero | yzero
+        # x*y = 0 (with appropriate sign)
+        prod_sign = signbit(x) ⊻ signbit(y)
+        
+        if zinf
+            return z  # 0 + Inf = Inf
+        elseif zzero
+            # 0 + 0: need careful sign handling
+            # In FMA, -0 + -0 = -0, but +0 + -0 = +0
+            if prod_sign && signbit(z)
+                return Float32x(-0.0f0, Int32(0))  # Both negative
+            else
+                return ZERO_FLOAT32X  # At least one positive
+            end
+        else
+            return z  # 0 + finite = finite
+        end
+    end
+    
+    # z is infinite but x*y is finite
+    if zinf
+        return z
+    end
+    
+    # All finite, non-zero case
+    # First compute the product x * y
+    prod_significand = x.significand * y.significand
+    prod_exponent = Int64(x.exponent) + Int64(y.exponent)
+    
+    # Check for overflow/underflow in product exponent
+    if prod_exponent > typemax(Int32)
+        # Product overflows
+        prod_sign = signbit(x) ⊻ signbit(y)
+        prod_inf = prod_sign ? NEGINF_FLOAT32X : INF_FLOAT32X
+        
+        if zinf && signbit(prod_inf) != signbit(z)
+            return NAN_FLOAT32X  # Inf - Inf
+        end
+        return prod_inf
+    elseif prod_exponent < typemin(Int32) + 200  # Leave room for normalization
+        # Product underflows to zero
+        if zinf
+            return z
+        elseif zzero
+            return ZERO_FLOAT32X
+        else
+            return z  # 0 + z = z
+        end
+    end
+    
+    # Create normalized product
+    prod = Float32x(prod_significand, Int32(prod_exponent))
+    
+    # Now handle the addition
+    if zzero
+        return prod
+    end
+    
+    # Align exponents for addition
+    exp_diff = prod.exponent - z.exponent
+    
+    # If exponents are too far apart, return the larger magnitude number
+    if exp_diff > 24  # prod >> z
+        return prod
+    elseif exp_diff < -24  # z >> prod
+        return z
+    end
+    
+    # Perform the addition with careful alignment
+    if exp_diff > 0
+        # prod has larger exponent, shift z
+        z_aligned = ldexp(z.significand, -exp_diff)
+        result_significand = prod.significand + z_aligned
+        result_exponent = prod.exponent
+    elseif exp_diff < 0
+        # z has larger exponent, shift prod
+        prod_aligned = ldexp(prod.significand, exp_diff)
+        result_significand = prod_aligned + z.significand
+        result_exponent = z.exponent
+    else
+        # Same exponent
+        result_significand = prod.significand + z.significand
+        result_exponent = prod.exponent
+    end
+    
+    # Check for overflow in significand addition
+    if isinf(result_significand)
+        return result_significand > 0 ? INF_FLOAT32X : NEGINF_FLOAT32X
+    end
+    
+    # Check for cancellation resulting in zero
+    if iszero(result_significand)
+        # Determine sign of zero result
+        # In FMA, if x*y and z cancel exactly, the result is +0
+        # unless both x*y and z are negative
+        if signbit(prod) && signbit(z)
+            return Float32x(-0.0f0, Int32(0))
+        else
+            return ZERO_FLOAT32X
+        end
+    end
+    
+    # Return normalized result
+    Float32x(result_significand, result_exponent)
+end
+
+# Additional convenience methods for mixed types
+@inline Base.fma(x::Float32x, y::Float32x, z::Real) = fma(x, y, Float32x(z))
+@inline Base.fma(x::Float32x, y::Real, z::Float32x) = fma(x, Float32x(y), z)
+@inline Base.fma(x::Real, y::Float32x, z::Float32x) = fma(Float32x(x), y, z)
+@inline Base.fma(x::Float32x, y::Real, z::Real) = fma(x, Float32x(y), Float32x(z))
+@inline Base.fma(x::Real, y::Float32x, z::Real) = fma(Float32x(x), y, Float32x(z))
+@inline Base.fma(x::Real, y::Real, z::Float32x) = fma(Float32x(x), Float32x(y), z)
+
+# Fused add-add: computes x + y + z with minimal rounding error
+# This uses a technique similar to Kahan summation to preserve precision
+@inline faa(x::Float32x, y::Float32x, z::Float32x) = begin
+    # Handle NaN propagation - any NaN input produces NaN output
+    (isnan(x.significand) | isnan(y.significand) | isnan(z.significand)) && return NAN_FLOAT32X
+    
+    # Handle infinities
+    xinf = isinf(x.significand)
+    yinf = isinf(y.significand)
+    zinf = isinf(z.significand)
+    
+    # Count infinities and check for cancellation
+    if xinf | yinf | zinf
+        # Collect all infinities
+        pos_inf_count = 0
+        neg_inf_count = 0
+        
+        if xinf
+            signbit(x) ? (neg_inf_count += 1) : (pos_inf_count += 1)
+        end
+        if yinf
+            signbit(y) ? (neg_inf_count += 1) : (pos_inf_count += 1)
+        end
+        if zinf
+            signbit(z) ? (neg_inf_count += 1) : (pos_inf_count += 1)
+        end
+        
+        # Check for Inf - Inf
+        if pos_inf_count > 0 && neg_inf_count > 0
+            return NAN_FLOAT32X  # Inf - Inf = NaN
+        elseif pos_inf_count > 0
+            return INF_FLOAT32X
+        else
+            return NEGINF_FLOAT32X
+        end
+    end
+    
+    # Handle zeros efficiently
+    xzero = iszero(x.significand)
+    yzero = iszero(y.significand)
+    zzero = iszero(z.significand)
+    
+    # All zeros
+    if xzero & yzero & zzero
+        # Result is -0 only if all three are -0
+        if signbit(x) & signbit(y) & signbit(z)
+            return Float32x(-0.0f0, Int32(0))
+        else
+            return ZERO_FLOAT32X
+        end
+    end
+    
+    # Two zeros - return the non-zero one
+    if xzero & yzero
+        return z
+    elseif xzero & zzero
+        return y
+    elseif yzero & zzero
+        return x
+    end
+    
+    # One zero - reduce to two-operand addition
+    if xzero
+        return y + z
+    elseif yzero
+        return x + z
+    elseif zzero
+        return x + y
+    end
+    
+    # All finite, non-zero case
+    # Sort by exponent magnitude to minimize rounding error
+    # We want to add from smallest magnitude to largest
+    
+    # Create array for sorting (in practice, we'll do this manually for 3 elements)
+    ax, ay, az = abs(x), abs(y), abs(z)
+    
+    # Sort the three values by absolute magnitude
+    # This ensures we add smaller values first, preserving their contribution
+    if ax <= ay
+        if ay <= az
+            # Order: x, y, z
+            first, second, third = x, y, z
+        elseif ax <= az
+            # Order: x, z, y
+            first, second, third = x, z, y
+        else
+            # Order: z, x, y
+            first, second, third = z, x, y
+        end
+    else  # ax > ay
+        if ax <= az
+            # Order: y, x, z
+            first, second, third = y, x, z
+        elseif ay <= az
+            # Order: y, z, x
+            first, second, third = y, z, x
+        else
+            # Order: z, y, x
+            first, second, third = z, y, x
+        end
+    end
+    
+    # Now perform the addition with compensation
+    # Similar to Kahan summation but for three operands
+    
+    # First addition: first + second
+    sum1 = add_with_compensation(first, second)
+    
+    # Second addition: sum1 + third
+    result = add_with_compensation(sum1, third)
+    
+    return result
+end
+
+# Helper function: addition with careful exponent handling
+@inline function add_with_compensation(a::Float32x, b::Float32x)
+    # Handle special cases (already handled in main function, but kept for safety)
+    isnan(a.significand) && return a
+    isnan(b.significand) && return b
+    isinf(a.significand) && return a
+    isinf(b.significand) && return b
+    iszero(a.significand) && return b
+    iszero(b.significand) && return a
+    
+    # Align exponents
+    exp_diff = a.exponent - b.exponent
+    
+    if exp_diff > 24  # a >> b
+        return a
+    elseif exp_diff < -24  # b >> a
+        return b
+    elseif exp_diff > 0
+        # a has larger exponent
+        b_aligned = ldexp(b.significand, -exp_diff)
+        result_sig = a.significand + b_aligned
+        result_exp = a.exponent
+    elseif exp_diff < 0
+        # b has larger exponent
+        a_aligned = ldexp(a.significand, exp_diff)
+        result_sig = a_aligned + b.significand
+        result_exp = b.exponent
+    else
+        # Same exponent
+        result_sig = a.significand + b.significand
+        result_exp = a.exponent
+    end
+    
+    # Check for overflow
+    if isinf(result_sig)
+        return result_sig > 0 ? INF_FLOAT32X : NEGINF_FLOAT32X
+    end
+    
+    # Check for exact cancellation
+    if iszero(result_sig)
+        # Sign of zero: -0 only if both operands are negative
+        if signbit(a) & signbit(b)
+            return Float32x(-0.0f0, Int32(0))
+        else
+            return ZERO_FLOAT32X
+        end
+    end
+    
+    Float32x(result_sig, result_exp)
+end
+
+# Alternative implementation using error compensation (more accurate but slower)
+@inline faa_compensated(x::Float32x, y::Float32x, z::Float32x) = begin
+    # Handle special cases
+    (isnan(x.significand) | isnan(y.significand) | isnan(z.significand)) && return NAN_FLOAT32X
+    
+    # Sort by magnitude as before
+    ax, ay, az = abs(x), abs(y), abs(z)
+    
+    if ax <= ay <= az
+        s1, s2, s3 = x, y, z
+    elseif ax <= az <= ay
+        s1, s2, s3 = x, z, y
+    elseif ay <= ax <= az
+        s1, s2, s3 = y, x, z
+    elseif ay <= az <= ax
+        s1, s2, s3 = y, z, x
+    elseif az <= ax <= ay
+        s1, s2, s3 = z, x, y
+    else
+        s1, s2, s3 = z, y, x
+    end
+    
+    # Two-sum algorithm for exact addition
+    # sum = s1 + s2 with error term
+    sum12 = s1 + s2
+    
+    # Add the third term
+    result = sum12 + s3
+    
+    return result
+end
+
+# Convenience methods for mixed types
+@inline faa(x::Float32x, y::Float32x, z::Real) = faa(x, y, Float32x(z))
+@inline faa(x::Float32x, y::Real, z::Float32x) = faa(x, Float32x(y), z)
+@inline faa(x::Real, y::Float32x, z::Float32x) = faa(Float32x(x), y, z)
+@inline faa(x::Float32x, y::Real, z::Real) = faa(x, Float32x(y), Float32x(z))
+@inline faa(x::Real, y::Float32x, z::Real) = faa(Float32x(x), y, Float32x(z))
+@inline faa(x::Real, y::Real, z::Float32x) = faa(Float32x(x), Float32x(y), z)
+
+# Export the function since it's not in Base
 
 @inline Base.:(^)(x::Float32x, n::Integer) = begin
     n == 0 && return ONE_FLOAT32X

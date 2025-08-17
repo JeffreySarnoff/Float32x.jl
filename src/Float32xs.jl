@@ -1,10 +1,10 @@
 """
-    Float32xModule
+    Float32xs
 
 A module implementing an extended precision floating-point type using a Float32 significand
 and Int32 exponent, providing operations similar to Float64.
 """
-module Float32xModule
+module Float32xs
 
 export Float32x, zero, one, inf, nan, eps
 export iszero, isone, isinf, isnan, isfinite, issubnormal, signbit
@@ -30,8 +30,8 @@ import Base: show, string, print
 import Base: promote_rule, convert
 import Base: nextfloat, prevfloat
 import Base: significand, exponent
-import Base: eps, typemin, typemax
-import Base: float, Float64, Float32, Float16
+import Base: eps, typemin, typemax, floatmin, floatmax
+import Base: float, Float64, Float32, Float16, BigFloat
 import Base: hash
 
 # ==================== Type Definition ====================
@@ -89,6 +89,12 @@ const FLOAT32_MIN_EXP = -126
 const FLOAT64_MAX_EXP = 1023
 const FLOAT64_MIN_EXP = -1022
 
+# Float32x can represent much larger/smaller values than Float32
+# The smallest normalized positive Float32x is 1.0 * 2^(typemin(Int32))
+# The largest finite Float32x is just under 2.0 * 2^(typemax(Int32))
+const FLOATMIN_FLOAT32X = Float32x(1.0f0, typemin(Int32))
+const FLOATMAX_FLOAT32X = Float32x(prevfloat(2.0f0), typemax(Int32))
+
 @inline Base.zero(::Type{Float32x}) = ZERO_FLOAT32X
 @inline Base.one(::Type{Float32x}) = ONE_FLOAT32X
 @inline inf(::Type{Float32x}) = INF_FLOAT32X
@@ -96,6 +102,8 @@ const FLOAT64_MIN_EXP = -1022
 @inline Base.eps(::Type{Float32x}) = EPS_FLOAT32X
 @inline Base.typemin(::Type{Float32x}) = NEGINF_FLOAT32X
 @inline Base.typemax(::Type{Float32x}) = INF_FLOAT32X
+@inline Base.floatmin(::Type{Float32x}) = FLOATMIN_FLOAT32X
+@inline Base.floatmax(::Type{Float32x}) = FLOATMAX_FLOAT32X
 
 # ==================== Predicates ====================
 
@@ -176,6 +184,28 @@ end
     Float32x(Float32(sig * 2), Int32(exp - 1))
 end
 
+@inline Base.convert(::Type{Float32x}, x::BigFloat) = begin
+    isnan(x) && return NAN_FLOAT32X
+    isinf(x) && return x > 0 ? INF_FLOAT32X : NEGINF_FLOAT32X
+    iszero(x) && return signbit(x) ? Float32x(-0.0f0, Int32(0)) : ZERO_FLOAT32X
+    
+    # Extract significand and exponent from BigFloat
+    # BigFloat maintains precision, so we need to carefully extract
+    sig_big, exp_big = frexp(x)
+    
+    # Convert significand to Float32 (may lose precision)
+    sig_f32 = Float32(sig_big * 2)  # Scale to [1, 2) range
+    
+    # Check for exponent overflow/underflow
+    if exp_big - 1 > typemax(Int32)
+        return signbit(x) ? NEGINF_FLOAT32X : INF_FLOAT32X
+    elseif exp_big - 1 < typemin(Int32)
+        return signbit(x) ? Float32x(-0.0f0, Int32(0)) : ZERO_FLOAT32X
+    end
+    
+    Float32x(sig_f32, Int32(exp_big - 1))
+end
+
 @inline Base.convert(::Type{Float64}, x::Float32x) = begin
     # Handle special cases
     isnan(x.significand) && return NaN64
@@ -215,13 +245,29 @@ end
     ldexp(x.significand, total_exp)
 end
 
+@inline Base.convert(::Type{BigFloat}, x::Float32x) = begin
+    # Handle special cases
+    isnan(x.significand) && return BigFloat(NaN)
+    isinf(x.significand) && return BigFloat(x.significand)
+    iszero(x.significand) && return BigFloat(x.significand)  # Preserves sign
+    
+    # Convert to BigFloat with full precision
+    # x = significand * 2^exponent
+    sig_big = BigFloat(x.significand)
+    
+    # Use ldexp for exact scaling
+    ldexp(sig_big, Int(x.exponent))
+end
+
 @inline Base.Float64(x::Float32x) = convert(Float64, x)
 @inline Base.Float32(x::Float32x) = convert(Float32, x)
+@inline Base.BigFloat(x::Float32x) = convert(BigFloat, x)
 @inline Base.float(x::Float32x) = x
 
 Base.promote_rule(::Type{Float32x}, ::Type{<:Integer}) = Float32x
 Base.promote_rule(::Type{Float32x}, ::Type{Float32}) = Float32x
 Base.promote_rule(::Type{Float32x}, ::Type{Float64}) = Float32x
+Base.promote_rule(::Type{Float32x}, ::Type{BigFloat}) = BigFloat
 
 # ==================== Basic Arithmetic ====================
 
@@ -483,8 +529,28 @@ Base.trunc(x::Float32x) = begin
     convert(Float32x, trunc(f64))
 end
 
-@inline Base.significand(x::Float32x) = Float64(x.significand)
-@inline Base.exponent(x::Float32x) = x.exponent
+# ---- More robust significand and exponent functions ----
+@inline Base.significand(x::Float32x) = begin
+    # Returns the significand as a Float64 in the range [1, 2) for normalized values
+    # Special cases return the appropriate values
+    isnan(x.significand) && return NaN64
+    isinf(x.significand) && return Float64(x.significand)
+    iszero(x.significand) && return copysign(0.0, x.significand)
+    Float64(x.significand)
+end
+
+@inline Base.exponent(x::Float32x) = begin
+    # Returns the binary exponent of x
+    # For special values, follows Julia's convention
+    isnan(x.significand) && throw(DomainError(x, "Cannot take exponent of NaN"))
+    isinf(x.significand) && throw(DomainError(x, "Cannot take exponent of Inf"))
+    iszero(x.significand) && throw(DomainError(x, "Cannot take exponent of zero"))
+    x.exponent
+end
+
+# ---- Robust floatmin and floatmax functions ----
+@inline Base.floatmin(x::Float32x) = floatmin(Float32x)
+@inline Base.floatmax(x::Float32x) = floatmax(Float32x)
 
 # ==================== Mathematical Functions ====================
 
@@ -671,6 +737,8 @@ end
 
 # ---- Utility functions ----
 @inline Base.ldexp(x::Float32x, n::Integer) = begin
+    # ldexp(x, n) = x * 2^n
+    # Handle special cases
     isnan(x.significand) | isinf(x.significand) | iszero(x.significand) && return x
     
     # Check for exponent overflow/underflow
@@ -684,8 +752,42 @@ end
     Float32x(x.significand, Int32(new_exp))
 end
 
-@inline Base.frexp(x::Float32x) = 
+# More robust ldexp that handles Float32 significand and separate integer exponent
+@inline Base.ldexp(s::Real, e::Integer, ::Type{Float32x}) = begin
+    # Create Float32x from separate significand and exponent
+    # This is useful for reconstructing values from frexp
+    sf = Float32(s)
+    isnan(sf) && return NAN_FLOAT32X
+    isinf(sf) && return sf > 0 ? INF_FLOAT32X : NEGINF_FLOAT32X
+    iszero(sf) && return copysign(ZERO_FLOAT32X, sf)
+    
+    # Normalize s to [1, 2) range if needed
+    sig, exp_adj = frexp(sf)
+    total_exp = Int64(e) + Int64(exp_adj)
+    
+    # Check for overflow/underflow
+    if total_exp > typemax(Int32)
+        return copysign(INF_FLOAT32X, sf)
+    elseif total_exp < typemin(Int32) + 200
+        return copysign(ZERO_FLOAT32X, sf)
+    end
+    
+    Float32x(Float32(sig * 2), Int32(total_exp - 1))
+end
+
+@inline Base.frexp(x::Float32x) = begin
+    # frexp returns (f, e) such that x = f * 2^e with 0.5 <= |f| < 1
+    # Special cases
+    isnan(x.significand) && return (NaN64, 0)
+    isinf(x.significand) && return (Float64(x.significand), 0)
+    iszero(x.significand) && return (copysign(0.0, x.significand), 0)
+    
+    # For Float32x with significand in [1, 2), we need to return f in [0.5, 1)
+    # x = significand * 2^exponent where significand ∈ [1, 2)
+    # We want: x = f * 2^e where f ∈ [0.5, 1)
+    # So: f = significand/2 and e = exponent + 1
     (Float64(x.significand) * 0.5, Int(x.exponent) + 1)
+end
 
 Base.modf(x::Float32x) = begin
     isnan(x.significand) | isinf(x.significand) && return (copysign(ZERO_FLOAT32X, x), x)

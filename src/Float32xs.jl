@@ -140,8 +140,22 @@ end
     # Zero handling: -0.0 == 0.0
     xzero = iszero(x.significand)
     yzero = iszero(y.significand)
+    
+    # Both zero - they're equal
     (xzero & yzero) && return false
     
+    # One is zero - handle specially
+    if xzero
+        # x is zero, y is not
+        # 0 < positive, 0 > negative
+        return !signbit(y)
+    elseif yzero
+        # y is zero, x is not
+        # negative < 0, positive > 0
+        return signbit(x)
+    end
+    
+    # Neither is zero - continue with normal comparison
     # Sign comparison
     xsign = signbit(x)
     ysign = signbit(y)

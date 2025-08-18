@@ -1,8 +1,8 @@
-module F32x
+module WideFloats
 
 export WideFloat, is_widefloat
-export F16x, F32x, F64x
-export zero, one, inf, nan, eps
+export Float16x, Float32x, Float64x
+  export zero, one, inf, nan, eps
 export iszero, isone, isinf, isnan, isfinite, issubnormal, signbit
 export abs, sign, copysign, flipsign, nextfloat, prevfloat
 export round, floor, ceil, trunc, significand, exponent
@@ -37,41 +37,42 @@ import Base: hash
 
 abstract type WideFloat <: AbstractFloat end
 
-primitive type F16x <: WideFloat  32 end
-primitive type F32x <: WideFloat  64 end
-primitive type F64x <: WideFloat 128 end
+primitive type Float16x <: WideFloat  32 end
+primitive type Float32x <: WideFloat  64 end
+primitive type Float64x <: WideFloat 128 end
 
 is_widefloat(x) = false
 is_widefloat(T::Type{<:AbstractFloat}) = T <: WideFloat
 is_widefloat(x::T) where {T} = T <: WideFloat
 
-const FX   = Union{F16x, F32x, F64x}
+const FX   = Union{Float16x, Float32x, Float64x}
 const UINT = Union{UInt32, UInt64, UInt128}
 
-Base.convert(::Type{F16x}, x::UInt32)  = reinterpret(F16x, x)
-Base.convert(::Type{F32x}, x::UInt64)  = reinterpret(F32x, x)
-Base.convert(::Type{F64x}, x::UInt128) = reinterpret(F64x, x)
+Base.convert(::Type{Float16x}, x::UInt32)  = reinterpret(Float16x, x)
+Base.convert(::Type{Float32x}, x::UInt64)  = reinterpret(Float32x, x)
+Base.convert(::Type{Float64x}, x::UInt128) = reinterpret(Float64x, x)
 
-F16x(x::UInt32)  = convert(F16x, x)
-F32x(x::UInt64)  = convert(F16x, x)
-F64x(x::UInt128) = convert(F16x, x)
+Float16x(x::UInt32)  = convert(Float16x, x)
+Float32x(x::UInt64)  = convert(Float16x, x)
+Float64x(x::UInt128) = convert(Float16x, x)
 
-Base.convert(::Type{UInt32},  x::F16x) = reinterpret(UInt32, x)
-Base.convert(::Type{UInt64},  x::F32x) = reinterpret(UInt64, x)
-Base.convert(::Type{UInt128}, x::F64x) = reinterpret(UInt128, x)
+Base.convert(::Type{UInt32},  x::Float16x) = reinterpret(UInt32, x)
+Base.convert(::Type{UInt64},  x::Float32x) = reinterpret(UInt64, x)
+Base.convert(::Type{UInt128}, x::Float64x) = reinterpret(UInt128, x)
 
-Base.UInt32(x::F16x)  = convert(UInt32, x)
-Base.Uint64(x::F32x)  = convert(UInt64, x)
-Base.UInt128(x::F64x) = convert(UInt128, x)
+Base.UInt32(x::Float16x)  = convert(UInt32, x)
+Base.Uint64(x::Float32x)  = convert(UInt64, x)
+Base.UInt128(x::Float64x) = convert(UInt128, x)
 
 # UnsignedHalf SignedHalf, Uint Float
-for (U, Hu, Hs, F) in ((:UInt32,  :UInt16, :Int16, :F16x), 
-                       (:UInt64,  :UInt32, :Int32, :F32x), 
-                       (:UInt128, :UInt64, :Int64, :F64x))
+for (U, Hu, Hs, F) in ((:UInt32,  :UInt16, :Int16, :Float16x), 
+                       (:UInt64,  :UInt32, :Int32, :Float32x), 
+                       (:UInt128, :UInt64, :Int64, :Float64x))
   @eval begin
     halfbits = 8*sizeof($Hu)
     lowones  = ~zero($U) >> halfbits
 
+          
     # enfold an FNxUIntN into (significand, exponent)
     enfold(@nospecialize(x::Union{$U, $F})) = x
     enfold(fr::$F, xp::$Hs) =
@@ -112,12 +113,26 @@ for (U, Hu, Hs, F) in ((:UInt32,  :UInt16, :Int16, :F16x),
   end # @eval
 end
 
-# UnsignedHalf SignedHalf, Uint Float
-for (U, Hu, Hs, F) in ((:UInt32,  :UInt16, :Int16, :F16x), 
-                       (:UInt64,  :UInt32, :Int32, :F32x), 
-                       (:UInt128, :UInt64, :Int64, :F64x))
+# U,              S,             Hu,          Hs,         F,     Fx 
+# UnsignedCarrier SignedCarrier, UnsignedHalf SignedHalf, Float, Floatx
+
+for (U, S, Hu, Hs, F, Fx) in (
+    (:UInt32,  :Int32, :UInt16, :Int16, :Float16, :Float16x), 
+    (:UInt64,  :Int64, :UInt32, :Int32, :Float32, :Float32x), 
+    (:UInt128, :Int128, :UInt64, :Int64, :Float64, :Float64x))
   @eval begin
-    
+ 
+    zerox   = zero($F)
+    posinfs = $F(Inf)
+    neginfx = $F(-Inf)
+    nanx    = $F(NaN)
+  
+    sign_bitmask = Base.sign_mask($F)
+    exp_bitmask  = Base.exponent_mask($F)
+    sig_bitmask  = Base.significand_mask($F)
+    exp_bitshift = trailing_zeros(exp_mask)
+    exp_biasm1   = Base.exponent_bias($F) - 0x01
+
     @inline function canonicalize(x::$F)
         # Handle zero
         iszero(x.significand) && return x
@@ -131,9 +146,9 @@ for (U, Hu, Hs, F) in ((:UInt32,  :UInt16, :Int16, :F16x),
         bits = reinterpret(UInt32, x.significand)
         
         # Extract components
-        sign_bit = bits & 0x80000000
-        exp_bits = (bits >> 23) & 0x000000ff
-        mantissa_bits = bits & 0x007fffff
+        sign_bit = bits & sign_bitmask
+        exp_bits = (bits >> exp_bitshift) & exp_bitmask
+        significand_bits = bits & sig_bitmask
         
         # Handle subnormal Float32 (exp_bits == 0)
         if exp_bits == 0x00
@@ -149,29 +164,28 @@ for (U, Hu, Hs, F) in ((:UInt32,  :UInt16, :Int16, :F16x),
         # Current unbiased exponent: exp_bits - 127
         # New significand will have exponent -1 (biased: 126)
         
-        canonical_bits = sign_bit | (UInt32(126) << 23) | mantissa_bits
-        canonical_sig = reinterpret(Float32, canonical_bits)
+        canonical_bits = sign_bit | ($Hu(exp_biasm1) << exp_bitshift) | significand_bits
+        canonical_sig = reinterpret($F, canonical_bits)
         
-        # Adjust Float32x exponent
-        # Original: mantissa * 2^(exp_bits-127) * 2^(x.exponent)
-        # New: mantissa * 2^(-1) * 2^(new_exponent)
+        # Adjust FloatNx exponent
+        # Original: significand * 2^(exp_bits-127) * 2^(x.exponent)
+        # New: significand * 2^(-1) * 2^(new_exponent)
         # So: new_exponent = x.exponent + (exp_bits - 127) + 1
         
-        exp_adjustment = Int32(exp_bits) - Int32(126)
-        total_exp = Int64(x.exponent) + Int64(exp_adjustment)
+        exp_adjustment = $Hs(exp_bits) - $Hs(exp_biasm1)
+        total_exp = $S(x.exponent) + $S(exp_adjustment)
         
         # Check bounds
-        if total_exp > typemax(Int32)
-            return iszero(sign_bit) ? INF_FLOAT32X : NEGINF_FLOAT32X
-        elseif total_exp < typemin(Int32)
-            return iszero(sign_bit) ? ZERO_FLOAT32X : $F(-zero($F), zero($I))
+        if total_exp > typemax($S)
+            return iszero(sign_bit) ? posinfx : neginfx
+        elseif total_exp < typemin($S)
+            return iszero(sign_bit) ? zerox : $F(-zerox, zerox)
         end
         
-        canonical_exp = Int32(total_exp)
+        canonical_exp = $S(total_exp)
 
         return $F(canonical_sig, canonical_exp)
     end
-
 
   end # @eval
 end
@@ -206,33 +220,31 @@ end
         signbit(x.significand)
     end
 end
-F32x(x::UInt64) = reinterpret(F32x, x)
-F32x(x::UInt64) = reinterpret(F32x, x)
+Float32x(x::UInt64) = reinterpret(Float32x, x)
+Float32x(x::UInt64) = reinterpret(Float32x, x)
 
-Base.UInt64(x::F32x) = x
+Base.UInt64(x::Float32x) = x
 
-function F32x(sig::Float32, xp::Int32)
-    reinterpret(F32x, enfold(sig, xp))
+function Float32x(sig::Float32, xp::Int32)
+    reinterpret(Float32x, enfold(sig, xp))
 end
 
-F32x(sigxp::Tuple{Float32, Int32}) = F32x(sigxp[1], sigxp[2])
+Float32x(sigxp::Tuple{Float32, Int32}) = Float32x(sigxp[1], sigxp[2])
 
-F32x(x::UInt64) = reinterpret(F32x, x)
+Float32x(x::UInt64) = reinterpret(Float32x, x)
 
-F32x(sig::Float64, xp::Int64) = F32x(Float32(sig), xp % Int32)
-F32x(sig::Float32, xp::Int64) = F32x(sig, xp % Int32)
-F32x(sig::Float64, xp::Int32) = F32x(Float32(sig), xp)
+Float32x(sig::Float64, xp::Int64) = Float32x(Float32(sig), xp % Int32)
+Float32x(sig::Float32, xp::Int64) = Float32x(sig, xp % Int32)
+Float32x(sig::Float64, xp::Int32) = Float32x(Float32(sig), xp)
 
 # rewrite the function to accept a Float32x value and, for zero and for non-finite values return the same value, and for finite values return the equivalent Float32x value in canonical form.  A Float32x value is in canonical form when the significand is either zero or the absolute value of the significand s in the clopen range [0.5, 1.0)
 
 # Canonicalize a Float32x value
 # Canonical form: significand is zero or |significand| ∈ [0.5, 1.0)
 
-
-
 # Bit manipulation version for maximum performance
 @inline function canonicalize(x::$F)
-    sig = x.signficand
+    sig = x.significand
     # Handle zero
     iszero(sig) && return x
     
@@ -247,7 +259,7 @@ F32x(sig::Float64, xp::Int32) = F32x(Float32(sig), xp)
     # Extract components
     sign_bit = bits & 0x80000000
     exp_bits = (bits >> 23) & 0x000000ff
-    mantissa_bits = bits & 0x007fffff
+    significand_bits = bits & 0x007fffff
     
     # Handle subnormal Float32 (exp_bits == 0)
     if exp_bits == zero($I)
@@ -263,12 +275,12 @@ F32x(sig::Float64, xp::Int32) = F32x(Float32(sig), xp)
     # Current unbiased exponent: exp_bits - 127
     # New significand will have exponent -1 (biased: 126)
     
-    canonical_bits = sign_bit | (UInt32(126) << 23) | mantissa_bits
+    canonical_bits = sign_bit | (UInt32(126) << 23) | significand_bits
     canonical_sig = reinterpret(Float32, canonical_bits)
     
     # Adjust Float32x exponent
-    # Original: mantissa * 2^(exp_bits-127) * 2^(x.exponent)
-    # New: mantissa * 2^(-1) * 2^(new_exponent)
+    # Original: significand * 2^(exp_bits-127) * 2^(x.exponent)
+    # New: significand * 2^(-1) * 2^(new_exponent)
     # So: new_exponent = x.exponent + (exp_bits - 127) + 1
     
     exp_adjustment = Int32(exp_bits) - Int32(126)
@@ -281,5 +293,5 @@ F32x(sig::Float64, xp::Int32) = F32x(Float32(sig), xp)
         return sign_bit == 0x00 ? ZERO_FLOAT32X : Float32x(-0.0f0, Int32(0))
     end
     
-    return F32x(canonical_sig, Int32(total_exp))
+    return Float32x(canonical_sig, Int32(total_exp))
 end
